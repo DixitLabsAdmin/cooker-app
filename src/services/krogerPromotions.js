@@ -4,7 +4,9 @@
 import { supabase } from './supabase';
 import axios from 'axios';
 
-const PROXY_BASE_URL = 'http://localhost:3001/api/kroger';
+const PROXY_BASE_URL = import.meta.env.VITE_KROGER_PROXY_URL 
+  ? `${import.meta.env.VITE_KROGER_PROXY_URL}/api/kroger`
+  : 'http://localhost:3001/api/kroger';
 
 class KrogerPromotionsService {
   /**
