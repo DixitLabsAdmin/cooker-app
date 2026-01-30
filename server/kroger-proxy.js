@@ -8,22 +8,41 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Allow multiple origins for dev, preview, and production
+// Kroger API Configuration
+const KROGER_CLIENT_ID = process.env.KROGER_CLIENT_ID;
+const KROGER_CLIENT_SECRET = process.env.KROGER_CLIENT_SECRET;
+const KROGER_API_BASE = 'https://api.kroger.com/v1';
+
+// CORS Configuration - handle both with and without trailing slash
 const allowedOrigins = [
-  'http://localhost:3000',      // Vite dev server
-  'http://localhost:4173',      // Vite preview
-  'http://localhost:5173',      // Alternative Vite port
+  'http://localhost:3000',
+  'http://localhost:4173',
+  'http://localhost:5173',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:4173',
   'http://127.0.0.1:5173',
-  process.env.FRONTEND_URL,
-].filter(Boolean);
+];
+
+// Add frontend URL from environment (with and without trailing slash)
+if (process.env.FRONTEND_URL) {
+  const frontendUrl = process.env.FRONTEND_URL.replace(/\/$/, ''); // Remove trailing slash
+  allowedOrigins.push(frontendUrl);
+  allowedOrigins.push(frontendUrl + '/'); // Also allow with trailing slash
+}
 
 const corsOptions = {
   origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, Postman, or server-to-server)
     if (!origin) return callback(null, true);
     
-    if (allowedOrigins.indexOf(origin) !== -1) {
+    // Check if origin matches (with or without trailing slash)
+    const originWithoutSlash = origin.replace(/\/$/, '');
+    const isAllowed = allowedOrigins.some(allowed => {
+      const allowedWithoutSlash = allowed.replace(/\/$/, '');
+      return originWithoutSlash === allowedWithoutSlash;
+    });
+    
+    if (isAllowed) {
       callback(null, true);
     } else {
       console.log('⚠️ Blocked origin:', origin);
@@ -32,28 +51,24 @@ const corsOptions = {
     }
   },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 };
 
 app.use(cors(corsOptions));
 app.use(express.json());
 
-// Kroger API credentials
-const CLIENT_ID = process.env.KROGER_CLIENT_ID || process.env.VITE_KROGER_CLIENT_ID;
-const CLIENT_SECRET = process.env.KROGER_CLIENT_SECRET || process.env.VITE_KROGER_CLIENT_SECRET;
-const BASE_URL = 'https://api.kroger.com/v1';
-
 // Token management
 let accessToken = null;
 let tokenExpiry = null;
 
-// Get or refresh access token
 async function getAccessToken() {
   if (accessToken && tokenExpiry && Date.now() < tokenExpiry) {
     return accessToken;
   }
 
   try {
-    const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
+    const credentials = Buffer.from(`${KROGER_CLIENT_ID}:${KROGER_CLIENT_SECRET}`).toString('base64');
     
     const response = await axios.post(
       'https://api.kroger.com/v1/connect/oauth2/token',
@@ -61,18 +76,18 @@ async function getAccessToken() {
       {
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
-          'Authorization': `Basic ${credentials}`,
-        },
+          'Authorization': `Basic ${credentials}`
+        }
       }
     );
 
     accessToken = response.data.access_token;
-    tokenExpiry = Date.now() + (response.data.expires_in * 1000) - 60000;
+    tokenExpiry = Date.now() + (response.data.expires_in * 1000) - 60000; // Refresh 1 min early
     
     console.log('✅ Got new Kroger access token');
     return accessToken;
   } catch (error) {
-    console.error('❌ Error getting access token:', error.response?.data || error.message);
+    console.error('❌ Failed to get Kroger token:', error.response?.data || error.message);
     throw error;
   }
 }
@@ -80,123 +95,122 @@ async function getAccessToken() {
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
-    status: 'ok', 
+    status: 'ok',
     message: 'Kroger proxy server is running',
-    allowedOrigins: allowedOrigins.filter(o => o)
+    allowedOrigins: allowedOrigins
   });
-});
-
-// Search locations by ZIP code
-app.get('/api/kroger/locations', async (req, res) => {
-  try {
-    const { zipCode, radiusMiles = 10, limit = 10 } = req.query;
-    
-    if (!zipCode) {
-      return res.status(400).json({ error: 'zipCode is required' });
-    }
-
-    const token = await getAccessToken();
-    
-    const response = await axios.get(`${BASE_URL}/locations`, {
-      params: {
-        'filter.zipCode.near': zipCode,
-        'filter.radiusInMiles': radiusMiles,
-        'filter.limit': limit,
-      },
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json',
-      },
-    });
-
-    res.json(response.data);
-  } catch (error) {
-    console.error('❌ Locations search error:', error.response?.data || error.message);
-    res.status(error.response?.status || 500).json({
-      error: 'Failed to search locations',
-      details: error.response?.data || error.message,
-    });
-  }
 });
 
 // Search products
 app.get('/api/kroger/products', async (req, res) => {
   try {
-    const { term, locationId, limit = 10 } = req.query;
-    
-    if (!term) {
-      return res.status(400).json({ error: 'term is required' });
-    }
-
     const token = await getAccessToken();
-    
+    const { term, locationId, limit = 25 } = req.query;
+
     const params = {
       'filter.term': term,
-      'filter.limit': limit,
+      'filter.limit': limit
     };
-    
+
     if (locationId) {
       params['filter.locationId'] = locationId;
     }
 
-    const response = await axios.get(`${BASE_URL}/products`, {
-      params,
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json',
-      },
+    const response = await axios.get(`${KROGER_API_BASE}/products`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+      params: params
     });
 
     res.json(response.data);
   } catch (error) {
-    console.error('❌ Product search error:', error.response?.data || error.message);
+    console.error('❌ Server error:', error.message);
     res.status(error.response?.status || 500).json({
       error: 'Failed to search products',
-      details: error.response?.data || error.message,
+      details: error.response?.data || { error: error.message }
     });
   }
 });
 
-// Get product by ID
-app.get('/api/kroger/products/:productId', async (req, res) => {
+// Get product by UPC
+app.get('/api/kroger/products/:upc', async (req, res) => {
   try {
-    const { productId } = req.params;
+    const token = await getAccessToken();
+    const { upc } = req.params;
     const { locationId } = req.query;
 
-    const token = await getAccessToken();
-    
     const params = locationId ? { 'filter.locationId': locationId } : {};
 
-    const response = await axios.get(`${BASE_URL}/products/${productId}`, {
-      params,
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json',
-      },
+    const response = await axios.get(`${KROGER_API_BASE}/products/${upc}`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+      params: params
     });
 
     res.json(response.data);
   } catch (error) {
-    console.error('❌ Product detail error:', error.response?.data || error.message);
+    console.error('❌ Server error:', error.message);
     res.status(error.response?.status || 500).json({
       error: 'Failed to get product',
-      details: error.response?.data || error.message,
+      details: error.response?.data || { error: error.message }
     });
   }
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('❌ Server error:', err);
-  res.status(500).json({ error: 'Internal server error' });
+// Search locations
+app.get('/api/kroger/locations', async (req, res) => {
+  try {
+    const token = await getAccessToken();
+    const { zipCode, lat, lon, radiusMiles = 10, limit = 10 } = req.query;
+
+    const params = {
+      'filter.radiusInMiles': radiusMiles,
+      'filter.limit': limit
+    };
+
+    if (zipCode) {
+      params['filter.zipCode.near'] = zipCode;
+    } else if (lat && lon) {
+      params['filter.lat.near'] = lat;
+      params['filter.lon.near'] = lon;
+    } else {
+      return res.status(400).json({ error: 'zipCode or lat/lon required' });
+    }
+
+    const response = await axios.get(`${KROGER_API_BASE}/locations`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+      params: params
+    });
+
+    res.json(response.data);
+  } catch (error) {
+    console.error('❌ Server error:', error.message);
+    res.status(error.response?.status || 500).json({
+      error: 'Failed to search locations',
+      details: error.response?.data || { error: error.message }
+    });
+  }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Kroger proxy server running on http://localhost:${PORT}`);
-  console.log(`✅ Allowed origins:`, allowedOrigins.filter(o => o));
-  
-  if (!CLIENT_ID || !CLIENT_SECRET) {
-    console.warn('⚠️  WARNING: KROGER_CLIENT_ID or KROGER_CLIENT_SECRET not set!');
+// Get specific location
+app.get('/api/kroger/locations/:locationId', async (req, res) => {
+  try {
+    const token = await getAccessToken();
+    const { locationId } = req.params;
+
+    const response = await axios.get(`${KROGER_API_BASE}/locations/${locationId}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+
+    res.json(response.data);
+  } catch (error) {
+    console.error('❌ Server error:', error.message);
+    res.status(error.response?.status || 500).json({
+      error: 'Failed to get location',
+      details: error.response?.data || { error: error.message }
+    });
   }
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Kroger proxy server running on port ${PORT}`);
+  console.log(`✅ CORS enabled for:`, allowedOrigins);
 });
