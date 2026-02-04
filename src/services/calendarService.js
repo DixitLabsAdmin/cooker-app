@@ -202,7 +202,7 @@ class CalendarService {
     try {
       // Search inventory for matching ingredient
       const { data: inventoryItems, error } = await supabase
-        .from('inventory')
+        .from('inventory_items')
         .select('*')
         .ilike('name', `%${ingredientName}%`);
 

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../../services/supabase';
+import { usdaService } from '../../services/usda';
 
 export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
   const [recipe, setRecipe] = useState(null);
@@ -7,6 +8,7 @@ export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
   const [inventory, setInventory] = useState([]);
   const [ingredientStatus, setIngredientStatus] = useState({});
   const [loading, setLoading] = useState(true);
+  const [addingToShoppingList, setAddingToShoppingList] = useState(false);
 
   useEffect(() => {
     loadRecipeDetails();
@@ -25,13 +27,16 @@ export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
       if (recipeError) throw recipeError;
       setRecipe(recipeData);
 
-      // Load ingredients
+      // Load ingredients from recipe_ingredients table
       const { data: ingredientsData, error: ingredientsError } = await supabase
         .from('recipe_ingredients')
         .select('*')
-        .eq('recipe_id', recipeId);
+        .eq('recipe_id', recipeId)
+        .order('order_index', { ascending: true });
 
       if (ingredientsError) throw ingredientsError;
+      
+      console.log(`📋 Loaded ${ingredientsData?.length || 0} ingredients for recipe ${recipeId}`);
       setIngredients(ingredientsData || []);
     } catch (error) {
       console.error('Error loading recipe:', error);
@@ -56,25 +61,26 @@ export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
     }
   };
 
-  // Check ingredient availability
+  // Check ingredient availability against inventory
   useEffect(() => {
-    if (ingredients.length > 0 && inventory.length >= 0) {
+    if (ingredients.length > 0) {
       const status = {};
       
       ingredients.forEach(ingredient => {
-        const inventoryItem = inventory.find(item => 
-          item.name.toLowerCase().includes(ingredient.name.toLowerCase()) ||
-          ingredient.name.toLowerCase().includes(item.name.toLowerCase())
-        );
+        // Fuzzy match ingredient name against inventory
+        const inventoryItem = inventory.find(item => {
+          const invName = item.name.toLowerCase().trim();
+          const ingName = ingredient.name.toLowerCase().trim();
+          return invName.includes(ingName) || ingName.includes(invName);
+        });
         
         if (inventoryItem) {
-          // Check if we have enough quantity
-          const hasEnough = inventoryItem.amount >= ingredient.amount;
           status[ingredient.id] = {
             available: true,
-            hasEnough: hasEnough,
+            hasEnough: true, // Simplified - just checking presence
             inventoryAmount: inventoryItem.amount,
-            neededAmount: ingredient.amount
+            inventoryUnit: inventoryItem.unit,
+            inventoryName: inventoryItem.name
           };
         } else {
           status[ingredient.id] = {
@@ -94,6 +100,13 @@ export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
     }
 
     try {
+      // Delete ingredients first
+      await supabase
+        .from('recipe_ingredients')
+        .delete()
+        .eq('recipe_id', recipeId);
+
+      // Delete recipe
       const { error } = await supabase
         .from('recipes')
         .delete()
@@ -123,11 +136,12 @@ export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
 
   const addMissingIngredientsToShoppingList = async () => {
     try {
+      setAddingToShoppingList(true);
       const { data: { user } } = await supabase.auth.getUser();
       
       const missingIngredients = ingredients.filter(ingredient => {
         const status = ingredientStatus[ingredient.id];
-        return !status?.available || !status?.hasEnough;
+        return !status?.available;
       });
 
       if (missingIngredients.length === 0) {
@@ -135,25 +149,71 @@ export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
         return;
       }
 
-      const shoppingItems = missingIngredients.map(ingredient => ({
-        user_id: user.id,
-        name: ingredient.name,
-        amount: ingredient.amount,
-        unit: ingredient.unit || 'item',
-        category: 'Recipe Ingredient',
-        is_purchased: false
-      }));
+      console.log(`🛒 Adding ${missingIngredients.length} missing ingredients to shopping list`);
 
+      // Enrich ingredients with USDA data
+      let enrichedCount = 0;
+      const enrichedIngredients = await Promise.all(
+        missingIngredients.map(async (ingredient) => {
+          // Try to get USDA nutrition data
+          const nutritionData = await usdaService.quickNutritionLookup(ingredient.name);
+          
+          if (nutritionData && nutritionData.calories > 0) {
+            enrichedCount++;
+            console.log(`✅ Enriched: ${ingredient.name} → ${nutritionData.category}`);
+            return {
+              user_id: user.id,
+              name: ingredient.name,
+              amount: ingredient.amount || 1,
+              unit: ingredient.unit || 'item',
+              category: nutritionData.category || 'Other',
+              is_purchased: false,
+              calories: nutritionData.calories,
+              protein: nutritionData.protein,
+              carbs: nutritionData.carbs,
+              fat: nutritionData.fat,
+              serving_size: nutritionData.servingSize,
+              serving_unit: nutritionData.servingUnit
+            };
+          } else {
+            // Use existing nutrition data from recipe, but still try to categorize
+            const category = nutritionData?.category || usdaService.getShoppingCategory('', ingredient.name);
+            console.log(`⚠️ No USDA nutrition for: ${ingredient.name}, using recipe data, category: ${category}`);
+            return {
+              user_id: user.id,
+              name: ingredient.name,
+              amount: ingredient.amount || 1,
+              unit: ingredient.unit || 'item',
+              category: category,
+              is_purchased: false,
+              calories: ingredient.calories || 0,
+              protein: ingredient.protein || 0,
+              carbs: ingredient.carbs || 0,
+              fat: ingredient.fat || 0,
+              serving_size: ingredient.serving_size || 100,
+              serving_unit: ingredient.serving_unit || 'g'
+            };
+          }
+        })
+      );
+
+      // Insert all enriched ingredients
       const { error } = await supabase
         .from('shopping_list_items')
-        .insert(shoppingItems);
+        .insert(enrichedIngredients);
 
       if (error) throw error;
 
-      alert(`✅ Added ${missingIngredients.length} missing ingredients to shopping list!`);
+      const message = enrichedCount > 0
+        ? `✅ Added ${missingIngredients.length} ingredients to shopping list!\n🔬 ${enrichedCount} enriched with nutrition data`
+        : `✅ Added ${missingIngredients.length} ingredients to shopping list!`;
+      
+      alert(message);
     } catch (error) {
       console.error('Error adding to shopping list:', error);
       alert('Failed to add ingredients to shopping list');
+    } finally {
+      setAddingToShoppingList(false);
     }
   };
 
@@ -179,10 +239,11 @@ export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
     );
   }
 
-  const missingCount = ingredients.filter(ing => {
-    const status = ingredientStatus[ing.id];
-    return !status?.available || !status?.hasEnough;
-  }).length;
+  const availableCount = ingredients.filter(ing => ingredientStatus[ing.id]?.available).length;
+  const missingCount = ingredients.length - availableCount;
+  const matchPercentage = ingredients.length > 0 
+    ? Math.round((availableCount / ingredients.length) * 100) 
+    : 0;
 
   return (
     <div className="space-y-6">
@@ -302,33 +363,72 @@ export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
       {/* Ingredients Section with Inventory Check */}
       <div className="bg-white rounded-xl shadow-lg p-6">
         <div className="flex items-center justify-between mb-4">
-          <h3 className="text-xl font-bold text-gray-900">Ingredients</h3>
+          <div>
+            <h3 className="text-xl font-bold text-gray-900">Ingredients</h3>
+            {ingredients.length > 0 && (
+              <p className="text-sm text-gray-600 mt-1">
+                {availableCount} of {ingredients.length} in your inventory ({matchPercentage}% match)
+              </p>
+            )}
+          </div>
           {missingCount > 0 && (
             <button
               onClick={addMissingIngredientsToShoppingList}
-              className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium"
+              disabled={addingToShoppingList}
+              className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              🛒 Add {missingCount} Missing to Shopping List
+              {addingToShoppingList ? '⏳ Adding...' : `🛒 Add ${missingCount} Missing to Shopping List`}
             </button>
           )}
         </div>
+
+        {/* Inventory Match Summary */}
+        {ingredients.length > 0 && (
+          <div className={`mb-4 p-4 rounded-lg ${
+            matchPercentage >= 70 ? 'bg-green-50 border border-green-200' :
+            matchPercentage >= 50 ? 'bg-yellow-50 border border-yellow-200' :
+            'bg-red-50 border border-red-200'
+          }`}>
+            <div className="flex items-center gap-3">
+              <span className="text-3xl">
+                {matchPercentage >= 70 ? '🟢' : matchPercentage >= 50 ? '🟡' : '🔴'}
+              </span>
+              <div className="flex-1">
+                <div className="flex justify-between items-center mb-1">
+                  <span className="font-semibold text-gray-900">Inventory Match</span>
+                  <span className="font-bold text-lg">{matchPercentage}%</span>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div
+                    className={`h-2 rounded-full transition-all ${
+                      matchPercentage >= 70 ? 'bg-green-500' :
+                      matchPercentage >= 50 ? 'bg-yellow-500' :
+                      'bg-red-500'
+                    }`}
+                    style={{ width: `${matchPercentage}%` }}
+                  ></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {ingredients.length > 0 ? (
           <div className="space-y-2">
             {ingredients.map((ingredient) => {
               const status = ingredientStatus[ingredient.id] || {};
-              const isAvailable = status.available && status.hasEnough;
+              const isAvailable = status.available;
 
               return (
                 <div
                   key={ingredient.id}
                   className={`flex items-center justify-between p-3 rounded-lg ${
-                    isAvailable ? 'bg-green-50' : 'bg-red-50'
+                    isAvailable ? 'bg-green-50 border border-green-200' : 'bg-red-50 border border-red-200'
                   }`}
                 >
                   <div className="flex items-center gap-3">
                     {/* Status Icon */}
-                    <div className="text-2xl">
+                    <div className="text-xl">
                       {isAvailable ? '✅' : '❌'}
                     </div>
 
@@ -337,14 +437,23 @@ export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
                       <div className="font-medium text-gray-900">
                         {ingredient.amount} {ingredient.unit} {ingredient.name}
                       </div>
-                      {status.available && !status.hasEnough && (
-                        <div className="text-sm text-orange-600">
-                          Have {status.inventoryAmount} {ingredient.unit}, need {status.neededAmount}
+                      {isAvailable && status.inventoryAmount && (
+                        <div className="text-sm text-green-600">
+                          ✓ {status.inventoryAmount} {status.inventoryUnit} in inventory
                         </div>
                       )}
-                      {!status.available && (
+                      {!isAvailable && (
                         <div className="text-sm text-red-600">
                           Not in inventory
+                        </div>
+                      )}
+                      {/* Show nutrition if available */}
+                      {(ingredient.calories > 0 || ingredient.protein > 0) && (
+                        <div className="text-xs text-gray-500 mt-1">
+                          {ingredient.calories > 0 && `${ingredient.calories} cal`}
+                          {ingredient.protein > 0 && ` • ${ingredient.protein}g protein`}
+                          {ingredient.carbs > 0 && ` • ${ingredient.carbs}g carbs`}
+                          {ingredient.fat > 0 && ` • ${ingredient.fat}g fat`}
                         </div>
                       )}
                     </div>
@@ -363,7 +472,11 @@ export default function RecipeDetail({ recipeId, onEdit, onDelete, onBack }) {
         <div className="bg-white rounded-xl shadow-lg p-6">
           <h3 className="text-xl font-bold text-gray-900 mb-4">Instructions</h3>
           <div className="prose max-w-none">
-            <p className="text-gray-700 whitespace-pre-line">{recipe.instructions}</p>
+            {recipe.instructions.split('\n').map((paragraph, idx) => (
+              paragraph.trim() && (
+                <p key={idx} className="text-gray-700 mb-3">{paragraph}</p>
+              )
+            ))}
           </div>
         </div>
       )}

@@ -1,11 +1,15 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { supabase } from '../../services/supabase';
+import { usdaService } from '../../services/usda';
 
 export default function Inventory() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedCategory, setSelectedCategory] = useState('All');
-  const [expandedItems, setExpandedItems] = useState({}); // Track which items are expanded to show history
+  const [expandedItems, setExpandedItems] = useState({});
+  
+  // Background enrichment state
+  const enrichmentInProgress = useRef(false);
 
   const categories = [
     'All',
@@ -24,6 +28,13 @@ export default function Inventory() {
     loadItems();
   }, []);
 
+  // Start background enrichment when items load
+  useEffect(() => {
+    if (!loading && items.length > 0 && !enrichmentInProgress.current) {
+      startBackgroundEnrichment();
+    }
+  }, [items, loading]);
+
   const loadItems = async () => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
@@ -36,7 +47,6 @@ export default function Inventory() {
 
       if (error) throw error;
       
-      // Group and combine duplicate items
       const processedItems = processDuplicates(data || []);
       setItems(processedItems);
     } catch (error) {
@@ -46,7 +56,56 @@ export default function Inventory() {
     }
   };
 
-  // Process duplicates: combine same items but track purchase history
+  // Background enrichment for items without nutrition data
+  const startBackgroundEnrichment = async () => {
+    // Find all database items that need enrichment
+    const { data: { user } } = await supabase.auth.getUser();
+    const { data: rawItems } = await supabase
+      .from('inventory_items')
+      .select('*')
+      .eq('user_id', user.id);
+
+    if (!rawItems) return;
+
+    const itemsNeedingEnrichment = rawItems.filter(item =>
+      !item.calories || item.calories === 0
+    );
+
+    if (itemsNeedingEnrichment.length === 0) {
+      console.log('✅ All inventory items already enriched');
+      return;
+    }
+
+    enrichmentInProgress.current = true;
+    console.log(`🔄 Starting background enrichment for ${itemsNeedingEnrichment.length} inventory items`);
+
+    await usdaService.batchEnrichInBackground(
+      itemsNeedingEnrichment,
+      async (itemId, nutritionData) => {
+        // Update item in database
+        const { error } = await supabase
+          .from('inventory_items')
+          .update({
+            calories: nutritionData.calories,
+            protein: nutritionData.protein,
+            carbs: nutritionData.carbs,
+            fat: nutritionData.fat,
+            serving_size: nutritionData.servingSize,
+            serving_unit: nutritionData.servingUnit
+          })
+          .eq('id', itemId);
+
+        if (!error) {
+          // Reload to show updates
+          await loadItems();
+        }
+      }
+    );
+
+    enrichmentInProgress.current = false;
+    console.log('✅ Background enrichment complete');
+  };
+
   const processDuplicates = (rawItems) => {
     const itemMap = {};
 
@@ -54,9 +113,8 @@ export default function Inventory() {
       const key = item.name.toLowerCase().trim();
       
       if (!itemMap[key]) {
-        // First occurrence - create new entry
         itemMap[key] = {
-          id: item.id, // Use first ID as primary
+          id: item.id,
           name: item.name,
           category: item.category || 'Other',
           unit: item.unit || 'item',
@@ -79,11 +137,9 @@ export default function Inventory() {
           }]
         };
       } else {
-        // Duplicate found - combine amounts and track history
         const existing = itemMap[key];
         existing.totalAmount += (item.amount || 0);
         
-        // Track oldest and newest dates
         if (new Date(item.created_at) < new Date(existing.oldestDate)) {
           existing.oldestDate = item.created_at;
         }
@@ -91,7 +147,6 @@ export default function Inventory() {
           existing.newestDate = item.created_at;
         }
         
-        // Add to purchase history
         existing.purchaseHistory.push({
           id: item.id,
           amount: item.amount || 0,
@@ -99,7 +154,6 @@ export default function Inventory() {
           price: item.price
         });
         
-        // Sort purchase history by date (newest first)
         existing.purchaseHistory.sort((a, b) => 
           new Date(b.date) - new Date(a.date)
         );
@@ -109,13 +163,11 @@ export default function Inventory() {
     return Object.values(itemMap);
   };
 
-  // Check if item is 7+ days old
   const isOld = (date) => {
     const daysSinceAdded = (Date.now() - new Date(date)) / (1000 * 60 * 60 * 24);
     return daysSinceAdded >= 7;
   };
 
-  // Format date for display
   const formatDate = (dateString) => {
     const date = new Date(dateString);
     const now = new Date();
@@ -138,7 +190,6 @@ export default function Inventory() {
 
       if (error) throw error;
       
-      // Reload to recalculate combined amounts
       await loadItems();
     } catch (error) {
       console.error('Error deleting item:', error);
@@ -147,12 +198,10 @@ export default function Inventory() {
 
   const updateAmount = async (item, amountChange) => {
     try {
-      // Update the primary (first) purchase amount
       const primaryPurchase = item.purchaseHistory[0];
       const newAmount = primaryPurchase.amount + amountChange;
       
       if (newAmount <= 0) {
-        // If primary purchase amount becomes 0 or less, delete it
         await deleteItem(primaryPurchase.id);
         return;
       }
@@ -170,23 +219,16 @@ export default function Inventory() {
   };
 
   const toggleExpanded = (itemName) => {
-    console.log('🔍 Toggle clicked for:', itemName);
-    setExpandedItems(prev => {
-      const newState = {
-        ...prev,
-        [itemName]: !prev[itemName]
-      };
-      console.log('📋 Expanded state:', newState);
-      return newState;
-    });
+    setExpandedItems(prev => ({
+      ...prev,
+      [itemName]: !prev[itemName]
+    }));
   };
 
-  // Filter items by category
   const filteredItems = items.filter(item => 
     selectedCategory === 'All' || item.category === selectedCategory
   );
 
-  // Group items by category
   const groupedItems = filteredItems.reduce((acc, item) => {
     const category = item.category || 'Other';
     if (!acc[category]) {
@@ -196,12 +238,20 @@ export default function Inventory() {
     return acc;
   }, {});
 
-  // Sort items within each group (newest to oldest based on newestDate)
+  // Sort items within each category alphabetically by name
   Object.keys(groupedItems).forEach(category => {
     groupedItems[category].sort((a, b) => 
-      new Date(b.newestDate) - new Date(a.newestDate)
+      a.name.toLowerCase().localeCompare(b.name.toLowerCase())
     );
   });
+
+  // Sort categories alphabetically
+  const sortedCategories = Object.keys(groupedItems).sort((a, b) => 
+    a.toLowerCase().localeCompare(b.toLowerCase())
+  );
+
+  // Get categories that have items (for filter buttons)
+  const categoriesWithItems = ['All', ...sortedCategories];
 
   if (loading) {
     return (
@@ -217,7 +267,9 @@ export default function Inventory() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-2xl font-bold text-gray-900">Inventory</h2>
-          <p className="text-gray-600">{filteredItems.length} items in stock</p>
+          <p className="text-gray-600">
+            {filteredItems.length} items in stock
+          </p>
         </div>
       </div>
 
@@ -225,7 +277,7 @@ export default function Inventory() {
       <div className="bg-white rounded-xl shadow-lg p-4">
         <div className="flex flex-wrap gap-2 items-center">
           <span className="text-sm font-medium text-gray-700">Category:</span>
-          {categories.map(category => (
+          {categoriesWithItems.map(category => (
             <button
               key={category}
               onClick={() => setSelectedCategory(category)}
@@ -242,11 +294,12 @@ export default function Inventory() {
       </div>
 
       {/* Inventory Items Grouped by Category */}
-      {Object.keys(groupedItems).length > 0 ? (
+      {sortedCategories.length > 0 ? (
         <div className="space-y-4">
-          {Object.entries(groupedItems).map(([category, categoryItems]) => (
+          {sortedCategories.map(category => {
+            const categoryItems = groupedItems[category];
+            return (
             <div key={category} className="bg-white rounded-xl shadow-lg overflow-hidden">
-              {/* Category Header */}
               <div className="bg-green-600 px-4 py-2 flex items-center justify-between">
                 <h3 className="font-semibold text-white">{category}</h3>
                 <span className="bg-white text-green-600 px-2 py-1 rounded-full text-sm font-medium">
@@ -254,12 +307,12 @@ export default function Inventory() {
                 </span>
               </div>
 
-              {/* Items */}
               <div className="divide-y">
                 {categoryItems.map((item) => {
                   const isExpanded = expandedItems[item.name];
                   const showWarning = isOld(item.oldestDate);
                   const hasMultiplePurchases = item.purchaseHistory.length > 1;
+                  const hasNutrition = item.calories > 0 || item.protein > 0 || item.carbs > 0 || item.fat > 0;
 
                   return (
                     <div 
@@ -267,13 +320,11 @@ export default function Inventory() {
                       className={`p-4 ${hasMultiplePurchases ? 'cursor-pointer hover:bg-gray-50' : ''} transition-colors`}
                       onClick={() => {
                         if (hasMultiplePurchases) {
-                          console.log('🖱️ Clicked item:', item.name);
                           toggleExpanded(item.name);
                         }
                       }}
                     >
                       <div className="flex items-start gap-3">
-                        {/* Item Info */}
                         <div className="flex-1">
                           <div className="flex items-center gap-2">
                             <h4 className="font-medium text-gray-900">
@@ -284,31 +335,33 @@ export default function Inventory() {
                                 ⚠️ {Math.floor((Date.now() - new Date(item.oldestDate)) / (1000 * 60 * 60 * 24))} days old
                               </span>
                             )}
+                            {!hasNutrition && (
+                              <span className="px-2 py-1 bg-blue-100 text-blue-700 text-xs rounded-full font-medium">
+                                🔬 Searching nutrition...
+                              </span>
+                            )}
                           </div>
 
                           {item.brand_name && (
                             <p className="text-sm text-gray-600">{item.brand_name}</p>
                           )}
 
-                          {/* Amount Display */}
                           <div className="flex items-center gap-2 mt-2">
                             <span className="text-lg font-semibold text-green-600">
                               {item.totalAmount} {item.unit}
                             </span>
                             {hasMultiplePurchases && (
-                              <span className="text-sm text-blue-600 font-medium">
+                              <span className="text-sm text-blue-600 font-medium cursor-pointer">
                                 {isExpanded ? '▼' : '▶'} {item.purchaseHistory.length} purchases
                               </span>
                             )}
                           </div>
 
-                          {/* Date Added (oldest) */}
                           <p className="text-xs text-gray-500 mt-1">
                             First added: {formatDate(item.oldestDate)}
                           </p>
 
-                          {/* Nutrition Info */}
-                          {(item.calories > 0 || item.protein > 0 || item.carbs > 0 || item.fat > 0) && (
+                          {hasNutrition && (
                             <div className="flex flex-wrap gap-2 text-xs mt-2">
                               {item.serving_size && (
                                 <span className="text-gray-600">
@@ -330,11 +383,10 @@ export default function Inventory() {
                             </div>
                           )}
 
-                          {/* Purchase History Dropdown */}
                           {isExpanded && hasMultiplePurchases && (
                             <div className="mt-3 bg-gray-50 rounded-lg p-3 space-y-2">
                               <h5 className="text-sm font-semibold text-gray-900">Purchase History:</h5>
-                              {item.purchaseHistory.map((purchase, idx) => (
+                              {item.purchaseHistory.map((purchase) => (
                                 <div key={purchase.id} className="flex items-center justify-between text-sm">
                                   <div>
                                     <span className="font-medium text-gray-900">
@@ -364,12 +416,10 @@ export default function Inventory() {
                           )}
                         </div>
 
-                        {/* Actions */}
                         <div 
                           className="flex flex-col gap-2"
                           onClick={(e) => e.stopPropagation()}
                         >
-                          {/* Quick Adjust Amount */}
                           <div className="flex items-center gap-1">
                             <button
                               onClick={(e) => {
@@ -391,7 +441,6 @@ export default function Inventory() {
                             </button>
                           </div>
 
-                          {/* Delete All */}
                           {!isExpanded && (
                             <button
                               onClick={(e) => {
@@ -412,7 +461,8 @@ export default function Inventory() {
                 })}
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       ) : (
         <div className="bg-white rounded-xl shadow-lg p-12 text-center">
@@ -426,6 +476,23 @@ export default function Inventory() {
               : 'Try selecting a different category'
             }
           </p>
+        </div>
+      )}
+
+      {/* Enrichment Info Banner - At Bottom */}
+      {enrichmentInProgress.current && (
+        <div className="bg-blue-50 border-2 border-blue-200 rounded-lg p-4">
+          <div className="flex items-center gap-2">
+            <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-blue-600"></div>
+            <div>
+              <p className="font-medium text-blue-900">
+                🔬 Background Enrichment In Progress
+              </p>
+              <p className="text-sm text-blue-700">
+                We're automatically looking up nutrition data for your items. This happens in the background and won't slow down the app.
+              </p>
+            </div>
+          </div>
         </div>
       )}
     </div>

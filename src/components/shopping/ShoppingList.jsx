@@ -1,6 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { supabase } from '../../services/supabase';
 import { krogerService } from '../../services/kroger';
+import { shoppingAssistantService } from '../../services/shoppingAssistant';
+import { usdaService } from '../../services/usda';
 
 export default function ShoppingList() {
   const [items, setItems] = useState([]);
@@ -11,6 +13,16 @@ export default function ShoppingList() {
   const [searchResults, setSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [showSearchResults, setShowSearchResults] = useState(false);
+  
+  // Claude Assistant State
+  const [assistantInput, setAssistantInput] = useState('');
+  const [assistantProcessing, setAssistantProcessing] = useState(false);
+  const [assistantResponse, setAssistantResponse] = useState(null);
+  const [showAssistant, setShowAssistant] = useState(true);
+
+  // Background enrichment state
+  const enrichmentInProgress = useRef(false);
+  const enrichmentCompleted = useRef(false); // Track if we've already enriched
 
   const categories = [
     'All',
@@ -29,28 +41,12 @@ export default function ShoppingList() {
     loadItems();
   }, []);
 
-  // Auto-enrich recipe ingredients when items are loaded
+  // Start background enrichment ONCE when items first load
   useEffect(() => {
-    const hasRecipeIngredients = items.some(item => 
-      item.category === 'Recipe Ingredient' && 
-      (!item.calories || item.calories === 0)
-    );
-    
-    if (hasRecipeIngredients && !loading) {
-      console.log('🔍 Detected recipe ingredients without nutrition, enriching...');
-      // Run enrichment after a short delay
-      const timer = setTimeout(() => {
-        enrichRecipeIngredients();
-      }, 1000);
-      
-      return () => clearTimeout(timer);
+    if (!loading && items.length > 0 && !enrichmentInProgress.current && !enrichmentCompleted.current) {
+      startBackgroundEnrichment();
     }
-  }, [items, loading]);
-
-  // Enrich recipe ingredients with Kroger and USDA data
-  useEffect(() => {
-    loadItems();
-  }, []);
+  }, [loading]); // ✅ Only depend on loading, not items
 
   const loadItems = async () => {
     try {
@@ -71,30 +67,129 @@ export default function ShoppingList() {
     }
   };
 
+  // Background enrichment - runs without blocking UI
+  const startBackgroundEnrichment = async () => {
+    const itemsNeedingEnrichment = items.filter(item =>
+      (!item.calories || item.calories === 0) &&
+      item.category !== 'Recipe Ingredient'
+    );
+
+    if (itemsNeedingEnrichment.length === 0) {
+      console.log('✅ All items already enriched');
+      enrichmentCompleted.current = true;
+      return;
+    }
+
+    enrichmentInProgress.current = true;
+    console.log(`🔄 Starting background enrichment for ${itemsNeedingEnrichment.length} items`);
+
+    await usdaService.batchEnrichInBackground(
+      itemsNeedingEnrichment,
+      async (itemId, nutritionData) => {
+        // Update item in database
+        const { error } = await supabase
+          .from('shopping_list_items')
+          .update({
+            calories: nutritionData.calories,
+            protein: nutritionData.protein,
+            carbs: nutritionData.carbs,
+            fat: nutritionData.fat,
+            serving_size: nutritionData.servingSize,
+            serving_unit: nutritionData.servingUnit
+          })
+          .eq('id', itemId);
+
+        if (!error) {
+          // Update local state
+          setItems(prevItems =>
+            prevItems.map(item =>
+              item.id === itemId
+                ? { ...item, ...nutritionData }
+                : item
+            )
+          );
+        }
+      }
+    );
+
+    enrichmentInProgress.current = false;
+    enrichmentCompleted.current = true; // Mark as completed
+    console.log('✅ Background enrichment complete');
+  };
+
+  // Claude Assistant: Process natural language command
+  const processAssistantCommand = async () => {
+    if (!assistantInput.trim()) return;
+
+    setAssistantProcessing(true);
+    setAssistantResponse(null);
+
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+
+      // Parse command with Claude
+      const parsed = await shoppingAssistantService.processCommand(assistantInput);
+
+      if (parsed.action === 'add') {
+        const results = await shoppingAssistantService.addItemsToShoppingList(
+          parsed.items,
+          supabase,
+          user.id
+        );
+
+        setAssistantResponse({
+          type: 'success',
+          message: `✅ Added ${results.added.length} items to your shopping list!`,
+          details: results.added.map(r => r.name),
+          enriched: results.enriched,
+          failed: results.failed
+        });
+
+        // Reload items
+        await loadItems();
+      } else if (parsed.action === 'remove') {
+        const results = await shoppingAssistantService.removeItemsFromShoppingList(
+          parsed.items,
+          supabase,
+          user.id
+        );
+
+        setAssistantResponse({
+          type: 'success',
+          message: `✅ Removed ${results.removed.length} items from your shopping list`,
+          details: results.removed.map(r => `${r.name} (${r.count} item${r.count > 1 ? 's' : ''})`),
+          notFound: results.notFound
+        });
+
+        // Reload items
+        await loadItems();
+      } else {
+        setAssistantResponse({
+          type: 'error',
+          message: `I couldn't understand that command. Try: "add chicken, milk, and eggs" or "remove milk"`
+        });
+      }
+
+      setAssistantInput('');
+    } catch (error) {
+      console.error('Assistant error:', error);
+      setAssistantResponse({
+        type: 'error',
+        message: `Error: ${error.message}`
+      });
+    } finally {
+      setAssistantProcessing(false);
+    }
+  };
+
   const addItem = async () => {
     if (!newItemName.trim()) return;
 
     try {
       const { data: { user } } = await supabase.auth.getUser();
 
-      // Search Kroger for nutrition data
-      let nutritionData = null;
-      try {
-        const krogerResults = await krogerService.searchProducts(newItemName, null, 1);
-        if (krogerResults && krogerResults.length > 0) {
-          const product = krogerResults[0];
-          nutritionData = {
-            calories: product.calories || 0,
-            protein: product.protein || 0,
-            carbs: product.carbs || 0,
-            fat: product.fat || 0,
-            servingSize: product.servingSize || 100,
-            servingUnit: product.servingUnit || 'g'
-          };
-        }
-      } catch (err) {
-        console.log('Could not fetch nutrition data:', err);
-      }
+      // Quick USDA lookup (uses cache if available)
+      const nutritionData = await usdaService.quickNutritionLookup(newItemName);
 
       const { data, error } = await supabase
         .from('shopping_list_items')
@@ -119,12 +214,29 @@ export default function ShoppingList() {
 
       setItems([data, ...items]);
       setNewItemName('');
+
+      // If no nutrition data, enrich in background
+      if (!nutritionData || nutritionData.calories === 0) {
+        usdaService.enrichItemInBackground(data.id, newItemName, async (itemId, enrichedData) => {
+          const { error: updateError } = await supabase
+            .from('shopping_list_items')
+            .update(enrichedData)
+            .eq('id', itemId);
+
+          if (!updateError) {
+            setItems(prevItems =>
+              prevItems.map(item =>
+                item.id === itemId ? { ...item, ...enrichedData } : item
+              )
+            );
+          }
+        });
+      }
     } catch (error) {
       console.error('Error adding item:', error);
     }
   };
 
-  // Search Kroger for products
   const searchKroger = async () => {
     if (!newItemName.trim()) return;
     
@@ -143,7 +255,6 @@ export default function ShoppingList() {
     }
   };
 
-  // Add item from Kroger search results
   const addItemFromSearch = async (product) => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
@@ -185,7 +296,6 @@ export default function ShoppingList() {
     try {
       const { data: { user } } = await supabase.auth.getUser();
 
-      // Update shopping list item
       const { error: updateError } = await supabase
         .from('shopping_list_items')
         .update({ is_purchased: !currentStatus })
@@ -193,14 +303,12 @@ export default function ShoppingList() {
 
       if (updateError) throw updateError;
 
-      // If marking as purchased, add to inventory
       if (!currentStatus) {
         const item = items.find(i => i.id === itemId);
         
         if (item) {
           console.log('✅ Adding to inventory:', item.name);
 
-          // Check if item already exists in inventory
           const { data: existingItems, error: checkError } = await supabase
             .from('inventory_items')
             .select('*')
@@ -210,20 +318,17 @@ export default function ShoppingList() {
           if (checkError) throw checkError;
 
           if (existingItems && existingItems.length > 0) {
-            // Update existing item - increase quantity
             const existingItem = existingItems[0];
             const { error: inventoryError } = await supabase
               .from('inventory_items')
               .update({
-                amount: existingItem.amount + (item.amount || 1),
-                updated_at: new Date().toISOString()
+                amount: existingItem.amount + (item.amount || 1)
               })
               .eq('id', existingItem.id);
 
             if (inventoryError) throw inventoryError;
             console.log('✅ Updated inventory quantity');
           } else {
-            // Add new item to inventory
             const { error: inventoryError } = await supabase
               .from('inventory_items')
               .insert({
@@ -248,7 +353,6 @@ export default function ShoppingList() {
         }
       }
 
-      // Update local state
       setItems(items.map(item => 
         item.id === itemId ? { ...item, is_purchased: !currentStatus } : item
       ));
@@ -293,195 +397,10 @@ export default function ShoppingList() {
     }
   };
 
-  // Smart category detection based on ingredient name
-  const categorizeIngredient = (name) => {
-    const nameLower = name.toLowerCase();
-    
-    // Produce
-    if (/tomato|lettuce|onion|garlic|pepper|carrot|celery|potato|spinach|kale|broccoli|cauliflower|cucumber|zucchini|squash|apple|banana|orange|lemon|lime|berry|fruit|vegetable|avocado|mushroom|ginger|herbs?|parsley|cilantro|basil/.test(nameLower)) {
-      return 'Produce';
-    }
-    
-    // Meat & Seafood
-    if (/chicken|beef|pork|turkey|lamb|fish|salmon|tuna|shrimp|meat|steak|ground|breast|thigh|wing|bacon|sausage|ham/.test(nameLower)) {
-      return 'Meat & Seafood';
-    }
-    
-    // Dairy
-    if (/milk|cheese|butter|cream|yogurt|dairy|egg|parmesan|cheddar|mozzarella/.test(nameLower)) {
-      return 'Dairy';
-    }
-    
-    // Bakery
-    if (/bread|bun|roll|bagel|croissant|muffin|flour|yeast|tortilla/.test(nameLower)) {
-      return 'Bakery';
-    }
-    
-    // Pantry
-    if (/oil|vinegar|salt|pepper|spice|sugar|rice|pasta|noodle|sauce|can|jar|stock|broth|soy sauce|honey|mustard|mayo|ketchup|olive oil|vegetable oil/.test(nameLower)) {
-      return 'Pantry';
-    }
-    
-    // Frozen
-    if (/frozen|ice/.test(nameLower)) {
-      return 'Frozen';
-    }
-    
-    // Beverages
-    if (/juice|soda|water|coffee|tea|drink|beverage|wine|beer/.test(nameLower)) {
-      return 'Beverages';
-    }
-    
-    // Snacks
-    if (/chip|cracker|cookie|candy|snack|popcorn|nuts?/.test(nameLower)) {
-      return 'Snacks';
-    }
-    
-    return 'Other';
-  };
-
-  // Enrich recipe ingredients with Kroger and USDA data
-  const enrichRecipeIngredients = async () => {
-    try {
-      console.log('🔍 Enriching recipe ingredients...');
-      
-      const { data: { user } } = await supabase.auth.getUser();
-      
-      // Find items in "Recipe Ingredient" category without nutrition data
-      const recipeItems = items.filter(item => 
-        item.category === 'Recipe Ingredient' && 
-        (!item.calories || item.calories === 0)
-      );
-
-      if (recipeItems.length === 0) {
-        console.log('✅ No recipe ingredients need enrichment');
-        return;
-      }
-
-      console.log(`📋 Found ${recipeItems.length} recipe ingredients to enrich`);
-
-      for (const item of recipeItems) {
-        try {
-          console.log(`🔍 Enriching: ${item.name}`);
-          
-          let productData = null;
-          let category = 'Other';
-          
-          // Try Kroger first
-          try {
-            const krogerResults = await krogerService.searchProducts(item.name, null, 1);
-            if (krogerResults && krogerResults.length > 0) {
-              const product = krogerResults[0];
-              
-              // Get category from Kroger
-              if (product.category) {
-                category = product.category;
-              }
-              
-              // Get nutrition from Kroger
-              if (product.calories > 0) {
-                productData = {
-                  calories: product.calories,
-                  protein: product.protein || 0,
-                  carbs: product.carbs || 0,
-                  fat: product.fat || 0,
-                  servingSize: product.servingSize || 100,
-                  servingUnit: product.servingUnit || 'g',
-                  price: product.price || null
-                };
-                console.log(`✅ Got nutrition from Kroger: ${product.calories} cal`);
-              }
-            }
-          } catch (err) {
-            console.log(`⚠️ Kroger search failed: ${err.message}`);
-          }
-
-          // If no nutrition from Kroger, try USDA
-          if (!productData || productData.calories === 0) {
-            try {
-              const { usdaService } = await import('../../services/usda');
-              const usdaResults = await usdaService.searchFoods(item.name, 1);
-              
-              if (usdaResults && usdaResults.length > 0) {
-                const usdaFood = usdaResults[0];
-                productData = {
-                  calories: usdaFood.calories || 0,
-                  protein: usdaFood.protein || 0,
-                  carbs: usdaFood.carbs || 0,
-                  fat: usdaFood.fat || 0,
-                  servingSize: usdaFood.servingSize || 100,
-                  servingUnit: usdaFood.servingUnit || 'g',
-                  price: productData?.price || null
-                };
-                console.log(`✅ Got nutrition from USDA: ${usdaFood.calories} cal`);
-              }
-            } catch (err) {
-              console.log(`⚠️ USDA lookup failed: ${err.message}`);
-            }
-          }
-
-          // Smart categorization if we don't have a good category
-          if (category === 'Other' || category === 'Recipe Ingredient') {
-            category = categorizeIngredient(item.name);
-            console.log(`🏷️ Categorized as: ${category}`);
-          }
-
-          // Update the item
-          if (productData && productData.calories > 0) {
-            const { error } = await supabase
-              .from('shopping_list_items')
-              .update({
-                category: category,
-                calories: productData.calories,
-                protein: productData.protein,
-                carbs: productData.carbs,
-                fat: productData.fat,
-                serving_size: productData.servingSize,
-                serving_unit: productData.servingUnit,
-                price: productData.price
-              })
-              .eq('id', item.id);
-
-            if (error) {
-              console.error(`❌ Database error for ${item.name}:`, error);
-              throw error;
-            }
-            console.log(`✅ Updated ${item.name}: ${category} | ${productData.calories} cal`);
-          } else {
-            // Just update category even if no nutrition
-            const { error } = await supabase
-              .from('shopping_list_items')
-              .update({ category: category })
-              .eq('id', item.id);
-
-            if (error) {
-              console.error(`❌ Database error updating category for ${item.name}:`, error);
-              throw error;
-            }
-            console.log(`✅ Updated ${item.name} category to: ${category}`);
-          }
-
-          // Small delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 200));
-        } catch (err) {
-          console.error(`❌ Error enriching ${item.name}:`, err);
-        }
-      }
-
-      // Reload items to show updates
-      await loadItems();
-      console.log('🎉 All recipe ingredients enriched!');
-    } catch (error) {
-      console.error('Error enriching recipe ingredients:', error);
-    }
-  };
-
   const filteredItems = items.filter(item => {
     if (selectedCategory !== 'All' && item.category !== selectedCategory) {
       return false;
     }
-    // If showPurchased is true, ONLY show purchased items
-    // If showPurchased is false, ONLY show unpurchased items
     if (showPurchased && !item.is_purchased) {
       return false;
     }
@@ -499,6 +418,21 @@ export default function ShoppingList() {
     acc[category].push(item);
     return acc;
   }, {});
+
+  // Sort items within each category alphabetically by name
+  Object.keys(groupedItems).forEach(category => {
+    groupedItems[category].sort((a, b) => 
+      a.name.toLowerCase().localeCompare(b.name.toLowerCase())
+    );
+  });
+
+  // Sort categories alphabetically
+  const sortedCategories = Object.keys(groupedItems).sort((a, b) => 
+    a.toLowerCase().localeCompare(b.toLowerCase())
+  );
+
+  // Get categories that have items (for filter buttons)
+  const categoriesWithItems = ['All', ...sortedCategories];
 
   const purchasedCount = items.filter(i => i.is_purchased).length;
   const totalCount = items.length;
@@ -532,7 +466,117 @@ export default function ShoppingList() {
         )}
       </div>
 
-      {/* Add Item */}
+      {/* Claude Assistant */}
+      {showAssistant && (
+        <div className="bg-gradient-to-r from-purple-50 to-blue-50 rounded-xl shadow-lg p-6 border-2 border-purple-200">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-purple-600 rounded-full flex items-center justify-center">
+                <span className="text-white text-xl">🤖</span>
+              </div>
+              <div>
+                <h3 className="font-bold text-gray-900">AI Shopping Assistant</h3>
+                <p className="text-sm text-gray-600">Powered by Claude</p>
+              </div>
+            </div>
+            <button
+              onClick={() => setShowAssistant(false)}
+              className="text-gray-400 hover:text-gray-600"
+            >
+              ✕
+            </button>
+          </div>
+
+          <div className="space-y-3">
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={assistantInput}
+                onChange={(e) => setAssistantInput(e.target.value)}
+                onKeyPress={(e) => e.key === 'Enter' && processAssistantCommand()}
+                placeholder='Try: "add chicken, pork, onions, milk, and cheese to shopping list"'
+                className="flex-1 px-4 py-3 border-2 border-purple-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                disabled={assistantProcessing}
+              />
+              <button
+                onClick={processAssistantCommand}
+                disabled={assistantProcessing || !assistantInput.trim()}
+                className="px-6 py-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {assistantProcessing ? '⏳ Processing...' : '🚀 Go'}
+              </button>
+            </div>
+
+            {/* Response */}
+            {assistantResponse && (
+              <div className={`p-4 rounded-lg ${
+                assistantResponse.type === 'success' 
+                  ? 'bg-green-50 border-2 border-green-200' 
+                  : 'bg-red-50 border-2 border-red-200'
+              }`}>
+                <p className={`font-medium ${
+                  assistantResponse.type === 'success' ? 'text-green-800' : 'text-red-800'
+                }`}>
+                  {assistantResponse.message}
+                </p>
+                {assistantResponse.details && assistantResponse.details.length > 0 && (
+                  <ul className="mt-2 text-sm text-gray-700 space-y-1">
+                    {assistantResponse.details.map((detail, idx) => (
+                      <li key={idx}>• {detail}</li>
+                    ))}
+                  </ul>
+                )}
+                {assistantResponse.enriched > 0 && (
+                  <p className="mt-2 text-sm text-blue-600">
+                    🔬 {assistantResponse.enriched} items enriched with nutrition data
+                  </p>
+                )}
+                {assistantResponse.failed && assistantResponse.failed.length > 0 && (
+                  <p className="mt-2 text-sm text-orange-600">
+                    ⚠️ {assistantResponse.failed.length} items failed to add
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Examples */}
+            <div className="text-xs text-gray-600">
+              <p className="font-medium mb-1">Example commands:</p>
+              <div className="space-y-1">
+                <button
+                  onClick={() => setAssistantInput("add 2 pounds of chicken breast, 5 apples, and 1 gallon of milk")}
+                  className="block hover:text-purple-600 transition-colors"
+                >
+                  • "add 2 pounds of chicken breast, 5 apples, and 1 gallon of milk"
+                </button>
+                <button
+                  onClick={() => setAssistantInput("add ground beef, pasta, and tomato sauce")}
+                  className="block hover:text-purple-600 transition-colors"
+                >
+                  • "add ground beef, pasta, and tomato sauce"
+                </button>
+                <button
+                  onClick={() => setAssistantInput("remove milk")}
+                  className="block hover:text-purple-600 transition-colors"
+                >
+                  • "remove milk"
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {!showAssistant && (
+        <button
+          onClick={() => setShowAssistant(true)}
+          className="w-full px-4 py-3 bg-purple-100 text-purple-700 rounded-lg hover:bg-purple-200 transition-colors font-medium"
+        >
+          🤖 Show AI Assistant
+        </button>
+      )}
+
+      {/* Manual Add Item */}
       <div className="bg-white rounded-xl shadow-lg p-4">
         <div className="flex gap-2 mb-4">
           <input
@@ -619,7 +663,7 @@ export default function ShoppingList() {
       <div className="bg-white rounded-xl shadow-lg p-4">
         <div className="flex flex-wrap gap-2 items-center">
           <span className="text-sm font-medium text-gray-700">Filter:</span>
-          {categories.map(category => (
+          {categoriesWithItems.map(category => (
             <button
               key={category}
               onClick={() => setSelectedCategory(category)}
@@ -646,11 +690,12 @@ export default function ShoppingList() {
       </div>
 
       {/* Shopping List Items */}
-      {Object.keys(groupedItems).length > 0 ? (
+      {sortedCategories.length > 0 ? (
         <div className="space-y-4">
-          {Object.entries(groupedItems).map(([category, categoryItems]) => (
+          {sortedCategories.map(category => {
+            const categoryItems = groupedItems[category];
+            return (
             <div key={category} className="bg-white rounded-xl shadow-lg overflow-hidden">
-              {/* Category Header - FIXED TEXT COLOR */}
               <div className="bg-green-600 px-4 py-2 flex items-center justify-between">
                 <h3 className="font-semibold text-white">{category}</h3>
                 <span className="bg-white text-green-600 px-2 py-1 rounded-full text-sm font-medium">
@@ -658,7 +703,6 @@ export default function ShoppingList() {
                 </span>
               </div>
 
-              {/* Items */}
               <div className="divide-y">
                 {categoryItems.map((item) => (
                   <div
@@ -668,7 +712,6 @@ export default function ShoppingList() {
                     }`}
                   >
                     <div className="flex items-start gap-3">
-                      {/* Checkbox */}
                       <button
                         onClick={() => togglePurchased(item.id, item.is_purchased)}
                         className={`mt-1 flex-shrink-0 w-6 h-6 rounded border-2 flex items-center justify-center transition-colors ${
@@ -684,7 +727,6 @@ export default function ShoppingList() {
                         )}
                       </button>
 
-                      {/* Item Details */}
                       <div className="flex-1">
                         <div className="flex items-start justify-between">
                           <div>
@@ -694,12 +736,10 @@ export default function ShoppingList() {
                               {item.name}
                             </h4>
                             
-                            {/* Amount */}
                             <p className="text-sm text-gray-600">
                               {item.amount} {item.unit}
                             </p>
 
-                            {/* Nutrition Info - ADDED PROTEIN, CARBS, FAT */}
                             {(item.calories > 0 || item.protein > 0 || item.carbs > 0 || item.fat > 0) && (
                               <div className="mt-1 flex flex-wrap gap-2 text-xs">
                                 {item.serving_size && (
@@ -730,7 +770,6 @@ export default function ShoppingList() {
                               </div>
                             )}
 
-                            {/* Price */}
                             {item.price && (
                               <p className="text-sm font-semibold text-green-600 mt-1">
                                 ${parseFloat(item.price).toFixed(2)}
@@ -738,7 +777,6 @@ export default function ShoppingList() {
                             )}
                           </div>
 
-                          {/* Delete Button */}
                           <button
                             onClick={() => deleteItem(item.id)}
                             className="text-red-600 hover:text-red-700 transition-colors p-1"
@@ -754,7 +792,8 @@ export default function ShoppingList() {
                 ))}
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       ) : (
         <div className="bg-white rounded-xl shadow-lg p-12 text-center">
@@ -764,7 +803,7 @@ export default function ShoppingList() {
           </h3>
           <p className="text-gray-600">
             {selectedCategory === 'All' 
-              ? 'Add items to get started' 
+              ? 'Use the AI assistant or add items manually to get started' 
               : 'Try selecting a different category'
             }
           </p>

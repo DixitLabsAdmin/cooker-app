@@ -209,7 +209,109 @@ app.get('/api/kroger/locations/:locationId', async (req, res) => {
     });
   }
 });
+// Claude API proxy
+app.post('/api/claude/messages', async (req, res) => {
+  try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    
+    if (!apiKey) {
+      return res.status(500).json({ error: 'API key not configured' });
+    }
 
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify(req.body)
+    });
+
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+// ============================================
+// MEALDB API PROXY (to avoid CORS issues)
+// ============================================
+const MEALDB_BASE = 'https://www.themealdb.com/api/json/v1/1';
+
+// Search recipes by name
+app.get('/api/mealdb/search', async (req, res) => {
+  try {
+    const { s } = req.query;
+    console.log(`🔍 MealDB search request for: "${s}"`);
+    const response = await fetch(`${MEALDB_BASE}/search.php?s=${encodeURIComponent(s || '')}`);
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    console.error('MealDB search error:', error);
+    res.status(500).json({ error: error.message, meals: null });
+  }
+});
+
+// Lookup recipe by ID
+app.get('/api/mealdb/lookup', async (req, res) => {
+  try {
+    const { i } = req.query;
+    console.log(`🔍 MealDB lookup request for ID: "${i}"`);
+    const response = await fetch(`${MEALDB_BASE}/lookup.php?i=${i}`);
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    console.error('MealDB lookup error:', error);
+    res.status(500).json({ error: error.message, meals: null });
+  }
+});
+
+// Filter recipes by ingredient
+app.get('/api/mealdb/filter', async (req, res) => {
+  try {
+    const { i } = req.query;
+    console.log(`🔍 MealDB filter request for ingredient: "${i}"`);
+    
+    const url = `${MEALDB_BASE}/filter.php?i=${encodeURIComponent(i || '')}`;
+    console.log(`📡 Fetching: ${url}`);
+    
+    const response = await fetch(url);
+    console.log(`📥 MealDB response status: ${response.status}`);
+    
+    const data = await response.json();
+    console.log(`📦 MealDB returned ${data.meals?.length || 0} meals`);
+    
+    res.json(data);
+  } catch (error) {
+    console.error('MealDB filter error:', error);
+    res.status(500).json({ error: error.message, meals: null });
+  }
+});
+
+// Get all categories
+app.get('/api/mealdb/categories', async (req, res) => {
+  try {
+    const response = await fetch(`${MEALDB_BASE}/categories.php`);
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    console.error('MealDB categories error:', error);
+    res.status(500).json({ error: error.message, categories: null });
+  }
+});
+
+// Get random recipe
+app.get('/api/mealdb/random', async (req, res) => {
+  try {
+    const response = await fetch(`${MEALDB_BASE}/random.php`);
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    console.error('MealDB random error:', error);
+    res.status(500).json({ error: error.message, meals: null });
+  }
+});
 app.listen(PORT, () => {
   console.log(`🚀 Kroger proxy server running on port ${PORT}`);
   console.log(`✅ CORS enabled for:`, allowedOrigins);

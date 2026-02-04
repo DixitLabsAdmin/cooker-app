@@ -12,6 +12,7 @@ import MealCalendar from './components/mealCalendar/MealCalendar';
 import NutritionReport from './components/report/NutritionReport';
 import HouseholdSettings from './components/settings/HouseholdSettings';
 import KrogerStoreSelector from './components/settings/KrogerStoreSelector';
+import AIAssistant from './pages/AIAssistant'; // NEW IMPORT
 import { KrogerStoreProvider } from './contexts/KrogerStoreContext';
 import Deals from './components/promotions/Deals';
 import ContactButton from './components/common/ContactButton';
@@ -21,8 +22,8 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [showSignup, setShowSignup] = useState(false);
   
-  // Navigation state - CHANGED DEFAULT TO 'deals'
-  const [activeTab, setActiveTab] = useState('deals');
+  // Navigation state - CHANGED DEFAULT TO 'assistant' (AI home)
+  const [activeTab, setActiveTab] = useState('assistant');
   
   // Recipe management state
   const [currentView, setCurrentView] = useState('list');
@@ -48,7 +49,7 @@ function App() {
       await authService.signOut();
       setCurrentView('list');
       setSelectedRecipe(null);
-      setActiveTab('deals'); // Changed from 'recipes' to 'deals'
+      setActiveTab('assistant'); // Changed to AI assistant home
     } catch (error) {
       console.error('Error signing out:', error);
     }
@@ -146,14 +147,26 @@ function App() {
           </div>
         </header>
 
-        {/* Navigation Tabs - NEW ORDER, NO COUPONS/ORDERS */}
+        {/* Navigation Tabs - AI ASSISTANT FIRST */}
         <div className="bg-white border-b">
           <div className="max-w-7xl mx-auto px-4">
-            <nav className="flex gap-4">
-              {/* 1. Deals - FIRST */}
+            <nav className="flex gap-2 justify-between">
+              {/* 1. AI Assistant - FIRST (HOME) */}
+              <button
+                onClick={() => setActiveTab('assistant')}
+                className={`px-3 py-4 font-medium border-b-2 transition-colors whitespace-nowrap ${
+                  activeTab === 'assistant'
+                    ? 'border-purple-600 text-purple-600'
+                    : 'border-transparent text-gray-600 hover:text-gray-900'
+                }`}
+              >
+                🤖 AI Assistant
+              </button>
+
+              {/* 2. Deals */}
               <button
                 onClick={() => setActiveTab('deals')}
-                className={`px-4 py-3 font-medium border-b-2 transition-colors ${
+                className={`px-3 py-4 font-medium border-b-2 transition-colors whitespace-nowrap ${
                   activeTab === 'deals'
                     ? 'border-green-600 text-green-600'
                     : 'border-transparent text-gray-600 hover:text-gray-900'
@@ -162,98 +175,101 @@ function App() {
                 🔥 Deals
               </button>
 
-              {/* 2. Shopping List */}
+              {/* 3. Shopping List */}
               <button
                 onClick={() => setActiveTab('shopping')}
-                className={`px-4 py-3 font-medium border-b-2 transition-colors ${
+                className={`px-3 py-4 font-medium border-b-2 transition-colors whitespace-nowrap ${
                   activeTab === 'shopping'
                     ? 'border-green-600 text-green-600'
                     : 'border-transparent text-gray-600 hover:text-gray-900'
                 }`}
               >
-                Shopping List
+                🛒 Shopping List
               </button>
 
-              {/* 3. Inventory */}
+              {/* 4. Inventory */}
               <button
                 onClick={() => setActiveTab('inventory')}
-                className={`px-4 py-3 font-medium border-b-2 transition-colors ${
+                className={`px-3 py-4 font-medium border-b-2 transition-colors whitespace-nowrap ${
                   activeTab === 'inventory'
                     ? 'border-green-600 text-green-600'
                     : 'border-transparent text-gray-600 hover:text-gray-900'
                 }`}
               >
-                Inventory
+                📦 Inventory
               </button>
 
-              {/* 4. Meal Ideas */}
+              {/* 5. Meal Ideas */}
               <button
                 onClick={() => setActiveTab('mealIdeas')}
-                className={`px-4 py-3 font-medium border-b-2 transition-colors ${
+                className={`px-3 py-4 font-medium border-b-2 transition-colors whitespace-nowrap ${
                   activeTab === 'mealIdeas'
                     ? 'border-green-600 text-green-600'
                     : 'border-transparent text-gray-600 hover:text-gray-900'
                 }`}
               >
-                Meal Ideas
+                💡 Meal Ideas
               </button>
 
-              {/* 5. Recipes */}
+              {/* 6. Recipes */}
               <button
                 onClick={() => {
                   setActiveTab('recipes');
                   setCurrentView('list');
                 }}
-                className={`px-4 py-3 font-medium border-b-2 transition-colors ${
+                className={`px-3 py-4 font-medium border-b-2 transition-colors whitespace-nowrap ${
                   activeTab === 'recipes'
                     ? 'border-green-600 text-green-600'
                     : 'border-transparent text-gray-600 hover:text-gray-900'
                 }`}
               >
-                Recipes
+                📖 Recipes
               </button>
 
-              {/* 6. Meal Calendar */}
+              {/* 7. Meal Calendar */}
               <button
                 onClick={() => setActiveTab('calendar')}
-                className={`px-4 py-3 font-medium border-b-2 transition-colors ${
+                className={`px-3 py-4 font-medium border-b-2 transition-colors whitespace-nowrap ${
                   activeTab === 'calendar'
                     ? 'border-green-600 text-green-600'
                     : 'border-transparent text-gray-600 hover:text-gray-900'
                 }`}
               >
-                Meal Calendar
+                📅 Calendar
               </button>
 
-              {/* 7. Report */}
+              {/* 8. Report */}
               <button
                 onClick={() => setActiveTab('report')}
-                className={`px-4 py-3 font-medium border-b-2 transition-colors ${
+                className={`px-3 py-4 font-medium border-b-2 transition-colors whitespace-nowrap ${
                   activeTab === 'report'
                     ? 'border-green-600 text-green-600'
                     : 'border-transparent text-gray-600 hover:text-gray-900'
                 }`}
               >
-                Report
+                📊 Report
               </button>
 
-              {/* 8. Settings */}
+              {/* 9. Settings */}
               <button
                 onClick={() => setActiveTab('settings')}
-                className={`px-4 py-3 font-medium border-b-2 transition-colors ${
+                className={`px-3 py-4 font-medium border-b-2 transition-colors whitespace-nowrap ${
                   activeTab === 'settings'
                     ? 'border-green-600 text-green-600'
                     : 'border-transparent text-gray-600 hover:text-gray-900'
                 }`}
               >
-                Settings
+                ⚙️ Settings
               </button>
             </nav>
           </div>
         </div>
 
         <main className="max-w-7xl mx-auto py-6 px-4">
-          {/* Deals Tab - FIRST */}
+          {/* AI Assistant - FIRST (HOME) */}
+          {activeTab === 'assistant' && <AIAssistant />}
+
+          {/* Deals Tab */}
           {activeTab === 'deals' && <Deals onNavigateToTab={setActiveTab} />}
 
           {/* Shopping List */}
@@ -323,7 +339,8 @@ function App() {
             </div>
           )}
         </main>
-                {/* Contact Button */}
+        
+        {/* Contact Button */}
         <ContactButton />
       </div>
     </KrogerStoreProvider>

@@ -140,6 +140,13 @@ export const userPreferencesService = {
   },
 
   /**
+   * Update household size
+   */
+  async updateHouseholdSize(size) {
+    return this.setPreference('household_size', size);
+  },
+
+  /**
    * Get Kroger store preferences
    */
   async getKrogerStore() {
